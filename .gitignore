@@ -1,0 +1,13 @@
+.build/
+dist/
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+._*
+/:-
+*.m4a
+*-transcript.txt
+*-transcript-raw.txt
+transcript.txt
+transcript.json
