@@ -52,7 +52,8 @@ The project requires Xcode (not just Command Line Tools) to build, because the C
 # Install Xcode from the App Store first.
 sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
-cd /Volumes/Lexar/everything/coding/macrec
+git clone https://github.com/eastmountaincode/macrec.git
+cd macrec
 swift build --product macrec
 swift build --product MacRecApp
 swift test
