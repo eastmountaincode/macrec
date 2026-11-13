@@ -35,6 +35,7 @@ actor LiveTranscriptRefiner {
     private var isEnabled = false
     private var isStopping = false
     private var isProcessing = false
+    private var processingError: String?
     private var pending: [LiveTranscriptEntry.Speaker: [LiveTranscriptAudioSegment]] = [:]
     private var flushTasks: [LiveTranscriptEntry.Speaker: Task<Void, Never>] = [:]
     private var queue: [Batch] = []
@@ -42,17 +43,12 @@ actor LiveTranscriptRefiner {
     private var coverageSamples: [Float] = []
     private var coverageStartSample = 0
     private var onUpdate: (@Sendable (LiveTranscriptionUpdate) async -> Void)?
-    private var onStatus: (@Sendable (String) -> Void)?
-    private var refinedBatchCount = 0
-    private var checkedBatchCount = 0
-    private var checkedCoverageCount = 0
-    private var quietBatchCount = 0
-    private var rejectedBatchCount = 0
+    private var onStatus: (@Sendable (RefinementStatus) -> Void)?
 
-    func prepare(onStatus: @escaping @Sendable (String) -> Void) async {
+    func prepare(onStatus: @escaping @Sendable (RefinementStatus) -> Void) async {
         self.onStatus = onStatus
         guard whisperKit == nil else {
-            onStatus("Accuracy refinement ready.")
+            onStatus(.ready)
             return
         }
         _ = await ensureModelLoaded()
@@ -61,7 +57,7 @@ actor LiveTranscriptRefiner {
     func start(
         enabled: Bool,
         onUpdate: @escaping @Sendable (LiveTranscriptionUpdate) async -> Void,
-        onStatus: @escaping @Sendable (String) -> Void
+        onStatus: @escaping @Sendable (RefinementStatus) -> Void
     ) {
         flushTasks.values.forEach { $0.cancel() }
         flushTasks = [:]
@@ -74,12 +70,7 @@ actor LiveTranscriptRefiner {
         self.onStatus = onStatus
         self.isEnabled = enabled
         self.isStopping = false
-        self.refinedBatchCount = 0
-        self.checkedBatchCount = 0
-        self.checkedCoverageCount = 0
-        self.quietBatchCount = 0
-        self.rejectedBatchCount = 0
-        onStatus(enabled ? (whisperKit == nil ? "Accuracy refinement is warming up..." : "Accuracy refinement ready.") : "Accuracy refinement off.")
+        onStatus(whisperKit == nil && enabled ? .preparing : .ready)
     }
 
     func enqueue(_ segment: LiveTranscriptAudioSegment) {
@@ -105,9 +96,8 @@ actor LiveTranscriptRefiner {
         }
     }
 
-    func appendSystemSample(_ sample: SystemAudioSample) {
-        guard isEnabled, !isStopping else { return }
-        guard let samples = LiveAudioConverter.floatSamples16kMono(from: sample), !samples.isEmpty else { return }
+    func appendSystemSamples(_ samples: [Float]) {
+        guard isEnabled, !isStopping, !samples.isEmpty else { return }
         coverageSamples.append(contentsOf: samples)
 
         let windowSamples = sampleRate * coverageWindowSeconds
@@ -149,7 +139,7 @@ actor LiveTranscriptRefiner {
         if whisperKit == nil {
             queue = []
             coverageQueue = []
-            onStatus?("Accuracy refinement was not ready; saved the live transcript.")
+            onStatus?(.unavailable("The live transcript has been saved."))
         }
         isEnabled = false
     }
@@ -248,6 +238,7 @@ actor LiveTranscriptRefiner {
     private func processQueue() async {
         guard !isProcessing else { return }
         isProcessing = true
+        processingError = nil
         defer { isProcessing = false }
 
         guard await ensureModelLoaded(), let whisperKit else { return }
@@ -260,14 +251,12 @@ actor LiveTranscriptRefiner {
             }
 
             let batch = queue.removeFirst()
-            checkedBatchCount += 1
             let level = Self.rms(batch.samples)
             guard level >= 0.0005 else {
-                quietBatchCount += 1
                 Self.logDiagnostic(batch: batch, refined: "", level: level, decision: "quiet")
                 continue
             }
-            onStatus?("Refining recent speech...")
+            onStatus?(.working)
 
             let options = DecodingOptions(
                 verbose: false,
@@ -296,7 +285,6 @@ actor LiveTranscriptRefiner {
                         .joined(separator: " ")
                 )
                 guard Self.shouldUse(refined: text, insteadOf: batch.originalText) else {
-                    rejectedBatchCount += 1
                     Self.logDiagnostic(batch: batch, refined: text, level: level, decision: "rejected")
                     continue
                 }
@@ -328,33 +316,22 @@ actor LiveTranscriptRefiner {
                     words: words
                 )
                 await onUpdate?(.replace(originalIDs: batch.originalIDs, with: entry))
-                if changedText {
-                    refinedBatchCount += 1
-                }
                 Self.logDiagnostic(batch: batch, refined: text, level: level, decision: changedText ? "replaced" : "aligned")
             } catch {
-                onStatus?("Accuracy refinement will continue: \(error.localizedDescription)")
+                processingError = error.localizedDescription
+                onStatus?(.unavailable(error.localizedDescription))
             }
         }
 
         if isEnabled {
-            if checkedCoverageCount > 0 {
-                let windows = checkedCoverageCount == 1 ? "1 call window" : "\(checkedCoverageCount) call windows"
-                let improved = refinedBatchCount == 1 ? "1 mic passage improved" : "\(refinedBatchCount) mic passages improved"
-                onStatus?("Whisper checked \(windows); \(improved).")
-            } else {
-                let checked = checkedBatchCount == 1 ? "1 passage" : "\(checkedBatchCount) passages"
-                let improved = refinedBatchCount == 1 ? "1 improved" : "\(refinedBatchCount) improved"
-                onStatus?("Accuracy refinement checked \(checked); \(improved).")
-            }
+            onStatus?(processingError.map { .unavailable($0) } ?? .ready)
         }
     }
 
     private func processCoverageBatch(_ batch: CoverageBatch, using whisperKit: WhisperKit) async {
-        checkedCoverageCount += 1
         let level = Self.rms(batch.samples)
         guard level >= 0.0005 else { return }
-        onStatus?("Checking recent call audio for missed speech...")
+        onStatus?(.working)
 
         let options = DecodingOptions(
             verbose: false,
@@ -420,7 +397,8 @@ actor LiveTranscriptRefiner {
                 )
             )
         } catch {
-            onStatus?("Call-audio coverage will continue: \(error.localizedDescription)")
+            processingError = error.localizedDescription
+            onStatus?(.unavailable(error.localizedDescription))
         }
     }
 
@@ -436,15 +414,12 @@ actor LiveTranscriptRefiner {
         isLoadingModel = true
         defer { isLoadingModel = false }
         do {
-            onStatus?("Preparing Whisper large v3 for accuracy refinement...")
+            onStatus?(.preparing)
             let cacheDirectory = try Self.modelCacheDirectory()
             let modelFolder = try await WhisperKit.download(
                 variant: modelID,
                 downloadBase: cacheDirectory
-            ) { [onStatus] progress in
-                let percent = Int(min(1, max(0, progress.fractionCompleted)) * 100)
-                onStatus?("Preparing accuracy refinement \(percent)%...")
-            }
+            )
             let config = WhisperKitConfig(
                 modelFolder: modelFolder.path,
                 tokenizerFolder: cacheDirectory,
@@ -456,11 +431,11 @@ actor LiveTranscriptRefiner {
                 useBackgroundDownloadSession: false
             )
             whisperKit = try await WhisperKit(config)
-            onStatus?("Accuracy refinement ready.")
+            onStatus?(.ready)
             return true
         } catch {
             whisperKit = nil
-            onStatus?("Accuracy refinement unavailable: \(error.localizedDescription)")
+            onStatus?(.unavailable(error.localizedDescription))
             return false
         }
     }

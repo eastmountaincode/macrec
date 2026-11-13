@@ -55,8 +55,8 @@ actor LocalMoonshineTranscriber {
     private var loadedModel: LiveTranscriptionModel?
     private var transcriber: Transcriber?
     private var streams: [LiveTranscriptEntry.Speaker: MoonshineVoice.Stream] = [:]
-    private var entries: [LiveTranscriptEntry] = []
-    private var fileEntries: [LiveTranscriptEntry] = []
+    private var entries: [String: LiveTranscriptEntry] = [:]
+    private var fileEntries: [String: LiveTranscriptEntry] = [:]
     private var isEnabled = false
     private var isStopping = false
     private var onUpdate: (@Sendable (LiveTranscriptionUpdate) -> Void)?
@@ -70,7 +70,7 @@ actor LocalMoonshineTranscriber {
         self.isEnabled = true
         self.isStopping = false
         self.onUpdate = onUpdate
-        onUpdate(.status("Preparing Moonshine model..."))
+        onUpdate(.status(.loading("Preparing model…")))
         onUpdate(.progress(0))
         Task { _ = await self.ensureModelLoaded(model: model) }
     }
@@ -85,18 +85,18 @@ actor LocalMoonshineTranscriber {
         self.isStopping = false
         self.onUpdate = onUpdate
         self.onFinalAudio = onFinalAudio
-        self.entries = []
+        self.entries = [:]
         self.submittedRefinementIDs = []
         onUpdate(.reset)
         onUpdate(.progress(nil))
 
         guard enabled else {
-            onUpdate(.status("Live transcript off"))
+            onUpdate(.status(.disabled))
             return
         }
 
         guard isReady(model: model), let transcriber else {
-            onUpdate(.status(model.loadPrompt))
+            onUpdate(.status(.idle))
             return
         }
 
@@ -106,9 +106,9 @@ actor LocalMoonshineTranscriber {
             streams[LiveTranscriptEntry.Speaker.call] = try makeStream(transcriber: transcriber, speaker: .call)
             try streams[LiveTranscriptEntry.Speaker.me]?.start()
             try streams[LiveTranscriptEntry.Speaker.call]?.start()
-            onUpdate(.status(model.readyStatus))
+            onUpdate(.status(.ready))
         } catch {
-            onUpdate(.status("Moonshine failed: \(error.localizedDescription)"))
+            onUpdate(.status(.failed(error.localizedDescription)))
         }
     }
 
@@ -118,9 +118,8 @@ actor LocalMoonshineTranscriber {
         append(samples, speaker: .me)
     }
 
-    func appendSystemSample(_ sample: SystemAudioSample) {
-        guard isEnabled, !isStopping else { return }
-        guard let samples = LiveAudioConverter.floatSamples16kMono(from: sample), !samples.isEmpty else { return }
+    func appendSystemSamples(_ samples: [Float]) {
+        guard isEnabled, !isStopping, !samples.isEmpty else { return }
         append(samples, speaker: .call)
     }
 
@@ -131,21 +130,21 @@ actor LocalMoonshineTranscriber {
             try closeStreams()
             try? await Task.sleep(nanoseconds: 200_000_000)
         } catch {
-            onUpdate?(.status("Moonshine stop failed: \(error.localizedDescription)"))
+            onUpdate?(.status(.failed(error.localizedDescription)))
         }
 
         guard let session, !entries.isEmpty else {
-            onUpdate?(.status("No transcript text captured."))
+            onUpdate?(.status(.finished("No speech captured")))
             return
         }
 
-        let text = renderTranscript(entries)
+        let text = renderTranscript(Array(entries.values))
         let url = session.directory.appendingPathComponent("\(session.fileStem)-live-transcript.txt")
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
-            onUpdate?(.status("Wrote live transcript."))
+            onUpdate?(.status(.finished("Transcript saved")))
         } catch {
-            onUpdate?(.status("Could not write live transcript: \(error.localizedDescription)"))
+            onUpdate?(.status(.failed("Could not save transcript: \(error.localizedDescription)")))
         }
     }
 
@@ -163,7 +162,7 @@ actor LocalMoonshineTranscriber {
         self.onUpdate = { update in
             switch update {
             case let .status(message):
-                onStatus(message, nil)
+                onStatus(message.message, nil)
             case let .progress(value):
                 onStatus("", value)
             case .reset, .entry, .replace, .replaceRange:
@@ -184,7 +183,7 @@ actor LocalMoonshineTranscriber {
             throw NSError(domain: "macrec", code: 52, userInfo: [NSLocalizedDescriptionKey: "No audio samples found in \(inputURL.lastPathComponent)."])
         }
 
-        fileEntries = []
+        fileEntries = [:]
         let stream = try transcriber.createStream(updateInterval: 0.25)
         stream.addListener { [weak self] event in
             let line = event.line
@@ -207,7 +206,7 @@ actor LocalMoonshineTranscriber {
                 stream.close()
             }
         }
-        onStatus("Transcribing audio 0%...", 0)
+        onStatus("Transcribing…", 0)
         let chunkSamples = Int(sampleRate)
         var offset = 0
         var chunksSubmitted = 0
@@ -222,7 +221,7 @@ actor LocalMoonshineTranscriber {
             let progress = min(1, Double(offset) / Double(samples.count))
             if progress == 1 || progress - lastReportedProgress >= 0.01 {
                 lastReportedProgress = progress
-                onStatus("Transcribing audio \(Int(progress * 100))%...", progress)
+                onStatus("Transcribing…", progress)
             }
             if chunksSubmitted.isMultiple(of: 10) {
                 await Task.yield()
@@ -235,7 +234,7 @@ actor LocalMoonshineTranscriber {
         try? await Task.sleep(nanoseconds: 300_000_000)
         try Task.checkCancellation()
 
-        let transcript = renderFileTranscript(fileEntries)
+        let transcript = renderFileTranscript(Array(fileEntries.values))
         guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(domain: "macrec", code: 53, userInfo: [NSLocalizedDescriptionKey: "No transcript text captured."])
         }
@@ -254,34 +253,34 @@ actor LocalMoonshineTranscriber {
     @discardableResult
     private func ensureModelLoaded(model: LiveTranscriptionModel) async -> Bool {
         if isReady(model: model) {
-            onUpdate?(.status(model.readyStatus))
+            onUpdate?(.status(.ready))
             onUpdate?(.progress(nil))
             return true
         }
 
         guard let modelArch = model.moonshineModelArch else {
-            onUpdate?(.status("Moonshine failed: unsupported model."))
+            onUpdate?(.status(.failed("Unsupported transcription model.")))
             onUpdate?(.progress(nil))
             return false
         }
 
         do {
-            onUpdate?(.status("Finding Moonshine model..."))
+            onUpdate?(.status(.loading("Preparing model…")))
             onUpdate?(.progress(0))
             let modelDirectory = try Self.modelDirectory(for: model)
             try await downloadMissingFiles(for: model, to: modelDirectory)
 
-            onUpdate?(.status("Warming up Moonshine locally..."))
+            onUpdate?(.status(.loading("Loading model…")))
             onUpdate?(.progress(nil))
             transcriber = try Transcriber(modelPath: modelDirectory.path, modelArch: modelArch)
             loadedModel = model
-            onUpdate?(.status(model.readyStatus))
+            onUpdate?(.status(.ready))
             onUpdate?(.progress(nil))
             return true
         } catch {
             transcriber = nil
             loadedModel = nil
-            onUpdate?(.status("Moonshine failed: \(error.localizedDescription)"))
+            onUpdate?(.status(.failed(error.localizedDescription)))
             onUpdate?(.progress(nil))
             return false
         }
@@ -301,7 +300,7 @@ actor LocalMoonshineTranscriber {
                 continue
             }
 
-            onUpdate?(.status("Downloading Moonshine model: \(component)"))
+            onUpdate?(.status(.loading("Downloading model…")))
             onUpdate?(.progress(Double(index) / Double(components.count)))
             let source = baseURL.appendingPathComponent(component)
             let (temporaryURL, response) = try await URLSession.shared.download(from: source)
@@ -338,7 +337,7 @@ actor LocalMoonshineTranscriber {
         do {
             try stream.addAudio(samples, sampleRate: sampleRate)
         } catch {
-            onUpdate?(.status("Moonshine transcription failed: \(error.localizedDescription)"))
+            onUpdate?(.status(.failed(error.localizedDescription)))
         }
     }
 
@@ -346,7 +345,7 @@ actor LocalMoonshineTranscriber {
         let text = Self.clean(line.text)
         guard !text.isEmpty else {
             if line.isComplete {
-                entries.removeAll { $0.id == line.id }
+                entries.removeValue(forKey: line.id)
             }
             return
         }
@@ -359,10 +358,10 @@ actor LocalMoonshineTranscriber {
             text: text,
             isFinal: line.isComplete
         )
-        entries.removeAll { $0.id == entry.id }
-        entries.append(entry)
-        entries.sort { $0.start < $1.start }
-        onUpdate?(.entry(entry))
+        if entries[entry.id] != entry {
+            entries[entry.id] = entry
+            onUpdate?(.entry(entry))
+        }
 
         if line.isComplete,
            !submittedRefinementIDs.contains(line.id),
@@ -377,7 +376,7 @@ actor LocalMoonshineTranscriber {
         let text = Self.clean(line.text)
         guard !text.isEmpty else {
             if line.isComplete {
-                fileEntries.removeAll { $0.id == line.id }
+                fileEntries.removeValue(forKey: line.id)
             }
             return
         }
@@ -390,9 +389,7 @@ actor LocalMoonshineTranscriber {
             text: text,
             isFinal: line.isComplete
         )
-        fileEntries.removeAll { $0.id == entry.id }
-        fileEntries.append(entry)
-        fileEntries.sort { $0.start < $1.start }
+        fileEntries[entry.id] = entry
     }
 
     private func closeStreams() throws {

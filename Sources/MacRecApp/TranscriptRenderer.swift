@@ -17,7 +17,9 @@ enum TranscriptRenderer {
         var lines: [String] = []
         var lastSpeaker: String?
 
-        for entry in entries.sorted(by: { $0.start < $1.start }) {
+        for entry in entries.sorted(by: {
+            $0.start == $1.start ? $0.id < $1.id : $0.start < $1.start
+        }) {
             let speaker = speakerName(entry)
             if !groupConsecutiveSpeakers || speaker != lastSpeaker {
                 if !lines.isEmpty {

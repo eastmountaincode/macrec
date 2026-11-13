@@ -4,138 +4,6 @@ import Foundation
 import MacRecCore
 @preconcurrency import WhisperKit
 
-struct LiveTranscriptEntry: Identifiable, Sendable, Equatable {
-    enum Speaker: Sendable, Hashable {
-        case me
-        case call
-
-        var displayName: String {
-            switch self {
-            case .me:
-                return "Me"
-            case .call:
-                return "Call"
-            }
-        }
-
-        var storageKey: String {
-            switch self {
-            case .me:
-                return "me"
-            case .call:
-                return "call"
-            }
-        }
-
-        var isCallAudio: Bool {
-            switch self {
-            case .call:
-                return true
-            case .me:
-                return false
-            }
-        }
-    }
-
-    let id: String
-    let speaker: Speaker
-    let start: Float
-    let end: Float
-    let text: String
-    let isFinal: Bool
-    let isRefined: Bool
-    let words: [LiveTranscriptWord]
-
-    init(
-        id: String = UUID().uuidString,
-        speaker: Speaker,
-        start: Float,
-        end: Float,
-        text: String,
-        isFinal: Bool = true,
-        isRefined: Bool = false,
-        words: [LiveTranscriptWord] = []
-    ) {
-        self.id = id
-        self.speaker = speaker
-        self.start = start
-        self.end = end
-        self.text = text
-        self.isFinal = isFinal
-        self.isRefined = isRefined
-        self.words = words
-    }
-}
-
-struct LiveTranscriptWord: Sendable, Equatable {
-    let text: String
-    let start: Float
-    let end: Float
-}
-
-struct LiveTranscriptAudioSegment: Sendable {
-    let entry: LiveTranscriptEntry
-    let samples: [Float]
-}
-
-enum LiveTranscriptionModel: String, CaseIterable, Identifiable, Sendable {
-    case moonshineMedium = "moonshine-medium-streaming-en"
-    case moonshineSmall = "moonshine-small-streaming-en"
-    case whisperLarge = "openai_whisper-large-v3-v20240930_626MB"
-    case whisperTurbo = "openai_whisper-large-v3-v20240930_turbo_632MB"
-    case whisperDistil = "distil-whisper_distil-large-v3_594MB"
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .moonshineMedium:
-            return "Moonshine medium"
-        case .moonshineSmall:
-            return "Moonshine small"
-        case .whisperLarge:
-            return "Whisper large v3"
-        case .whisperTurbo:
-            return "Whisper turbo"
-        case .whisperDistil:
-            return "Distil Whisper"
-        }
-    }
-
-    var isMoonshine: Bool {
-        switch self {
-        case .moonshineMedium, .moonshineSmall:
-            return true
-        case .whisperLarge, .whisperTurbo, .whisperDistil:
-            return false
-        }
-    }
-
-    var isWhisper: Bool { !isMoonshine }
-
-    var loadPrompt: String {
-        isMoonshine ? "Load Moonshine before recording." : "Load Whisper before recording."
-    }
-
-    var readyStatus: String {
-        isMoonshine ? "Moonshine ready." : "Whisper ready."
-    }
-}
-
-enum LiveTranscriptionUpdate: Sendable {
-    case reset
-    case status(String)
-    case progress(Double?)
-    case entry(LiveTranscriptEntry)
-    case replace(originalIDs: [String], with: LiveTranscriptEntry)
-    case replaceRange(
-        speaker: LiveTranscriptEntry.Speaker,
-        start: Float,
-        end: Float,
-        with: [LiveTranscriptEntry]
-    )
-}
-
 final class UncheckedSampleBuffer: @unchecked Sendable {
     let value: CMSampleBuffer
 
@@ -187,7 +55,7 @@ actor LocalWhisperTranscriber {
         self.isStopping = false
         self.modelID = modelID
         self.onUpdate = onUpdate
-        onUpdate(.status("Preparing Whisper model..."))
+        onUpdate(.status(.loading("Preparing model…")))
         onUpdate(.progress(0))
         Task { _ = await self.ensureModelLoaded() }
     }
@@ -212,15 +80,15 @@ actor LocalWhisperTranscriber {
         onUpdate(.progress(nil))
 
         guard enabled else {
-            onUpdate(.status("Live transcript off"))
+            onUpdate(.status(.disabled))
             onUpdate(.progress(nil))
             return
         }
 
         if isReady(modelID: modelID) {
-            onUpdate(.status("Whisper ready."))
+            onUpdate(.status(.ready))
         } else {
-            onUpdate(.status("Load Whisper before recording."))
+            onUpdate(.status(.idle))
         }
     }
 
@@ -241,9 +109,14 @@ actor LocalWhisperTranscriber {
         isStopping = true
         queueFinalChunks()
         await processQueue()
+        // An in-flight decode suspends this actor. Wait for that worker to drain
+        // the final chunks before saving or allowing a file transcription to start.
+        while isProcessing {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
 
         guard let session, !entries.isEmpty else {
-            onUpdate?(.status("No transcript text captured."))
+            onUpdate?(.status(.finished("No speech captured")))
             return
         }
 
@@ -251,9 +124,9 @@ actor LocalWhisperTranscriber {
         let url = session.directory.appendingPathComponent("\(session.fileStem)-live-transcript.txt")
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
-            onUpdate?(.status("Wrote live transcript."))
+            onUpdate?(.status(.finished("Transcript saved")))
         } catch {
-            onUpdate?(.status("Could not write live transcript: \(error.localizedDescription)"))
+            onUpdate?(.status(.failed("Could not save transcript: \(error.localizedDescription)")))
         }
     }
 
@@ -272,7 +145,7 @@ actor LocalWhisperTranscriber {
         self.onUpdate = { update in
             switch update {
             case let .status(message):
-                onStatus(message, nil)
+                onStatus(message.message, nil)
             case let .progress(value):
                 onStatus("", value)
             case .reset, .entry, .replace, .replaceRange:
@@ -296,7 +169,7 @@ actor LocalWhisperTranscriber {
         let chunkSamples = sampleRate * 30
         var offset = 0
         var fileEntries: [LiveTranscriptEntry] = []
-        onStatus("Transcribing audio 0%...", 0)
+        onStatus("Transcribing…", 0)
 
         while offset < samples.count {
             try Task.checkCancellation()
@@ -330,7 +203,7 @@ actor LocalWhisperTranscriber {
 
             offset = end
             let progress = min(1, Double(offset) / Double(samples.count))
-            onStatus("Transcribing audio \(Int(progress * 100))%...", progress)
+            onStatus("Transcribing…", progress)
         }
 
         onStatus("Writing transcript...", nil)
@@ -394,16 +267,16 @@ actor LocalWhisperTranscriber {
     @discardableResult
     private func ensureModelLoaded() async -> Bool {
         if whisperKit != nil, loadedModelID == modelID {
-            onUpdate?(.status("Whisper ready."))
+            onUpdate?(.status(.ready))
             onUpdate?(.progress(nil))
             return true
         }
 
         do {
-            onUpdate?(.status("Checking Whisper model cache..."))
+            onUpdate?(.status(.loading("Preparing model…")))
             onUpdate?(.progress(0))
             let cacheDirectory = try Self.modelCacheDirectory()
-            onUpdate?(.status("Preparing Whisper model files..."))
+            onUpdate?(.status(.loading("Downloading model…")))
             let modelFolder = try await WhisperKit.download(variant: modelID, downloadBase: cacheDirectory) { [onUpdate] progress in
                 let fraction = progress.fractionCompleted
                 guard fraction.isFinite else {
@@ -413,7 +286,7 @@ actor LocalWhisperTranscriber {
                 onUpdate?(.progress(min(1, max(0, fraction))))
             }
 
-            onUpdate?(.status("Warming up Whisper locally..."))
+            onUpdate?(.status(.loading("Loading model…")))
             onUpdate?(.progress(nil))
             let config = WhisperKitConfig(
                 modelFolder: modelFolder.path,
@@ -427,11 +300,11 @@ actor LocalWhisperTranscriber {
             )
             whisperKit = try await WhisperKit(config)
             loadedModelID = modelID
-            onUpdate?(.status("Whisper ready."))
+            onUpdate?(.status(.ready))
             onUpdate?(.progress(nil))
             return true
         } catch {
-            onUpdate?(.status("Whisper failed: \(error.localizedDescription)"))
+            onUpdate?(.status(.failed(error.localizedDescription)))
             onUpdate?(.progress(nil))
             whisperKit = nil
             loadedModelID = nil
@@ -509,7 +382,7 @@ actor LocalWhisperTranscriber {
             entries.sort { $0.start < $1.start }
             onUpdate?(.entry(entry))
         } catch {
-            onUpdate?(.status("Whisper transcription failed: \(error.localizedDescription)"))
+            onUpdate?(.status(.failed(error.localizedDescription)))
         }
     }
 
