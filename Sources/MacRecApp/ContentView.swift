@@ -37,8 +37,10 @@ struct ContentView: View {
 
     private var liveInputLayout: some View {
         HStack(alignment: .top, spacing: 18) {
-            controlColumn
-                .frame(minWidth: 780, maxWidth: .infinity, alignment: .top)
+            ScrollView {
+                controlColumn
+            }
+            .frame(minWidth: 740, maxWidth: .infinity, alignment: .top)
 
             if companionIsDocked {
                 Divider()
@@ -436,19 +438,19 @@ struct ContentView: View {
             if model.recents.isEmpty {
                 Text("No recordings yet.").foregroundStyle(.secondary).font(.callout)
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(model.recents.prefix(10), id: \.self) { url in
-                            HStack {
-                                Text(url.lastPathComponent).font(.callout)
-                                Spacer()
-                                Button("Show in Finder") { model.revealInFinder(url) }
-                                    .buttonStyle(.borderless)
-                            }
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(model.recents.prefix(10), id: \.self) { url in
+                        HStack {
+                            Text(url.lastPathComponent)
+                                .font(.callout)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button("Show in Finder") { model.revealInFinder(url) }
+                                .buttonStyle(.borderless)
                         }
                     }
                 }
-                .frame(maxHeight: 160)
             }
         }
     }

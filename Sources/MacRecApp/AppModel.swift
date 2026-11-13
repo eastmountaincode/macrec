@@ -1,5 +1,5 @@
 import AppKit
-import SwiftUI
+import Combine
 import UniformTypeIdentifiers
 import MacRecCore
 
@@ -366,6 +366,7 @@ final class AppModel: ObservableObject {
     }
 
     func chooseInputFile() {
+        guard !isFileTranscribing else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false

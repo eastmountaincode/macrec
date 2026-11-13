@@ -108,8 +108,6 @@ enum LiveTranscriptionModel: String, CaseIterable, Identifiable, Sendable {
     }
 
     var isWhisper: Bool { !isMoonshine }
-
-
 }
 
 enum LiveTranscriptionUpdate: Sendable {
